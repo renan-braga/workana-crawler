@@ -320,6 +320,7 @@ async def _send_to_workana(context: ContextTypes.DEFAULT_TYPE, entry: dict):
     short_id = entry["short_id"]
     config = context.bot_data.get("config", {})
     manual_submit = bool(config.get("workana", {}).get("manual_submit", False))
+    manual_submit_on_challenge = bool(config.get("workana", {}).get("manual_submit_on_challenge", True))
 
     _awaiting_context.pop(str(entry["chat_id"]), None)
 
@@ -345,6 +346,70 @@ async def _send_to_workana(context: ContextTypes.DEFAULT_TYPE, entry: dict):
         return
 
     from .crawler import WorkanaAccessDenied, WorkanaChallengeRequired
+
+    async def _open_manual_window_after_challenge() -> bool:
+        await context.bot.edit_message_text(
+            chat_id=entry["chat_id"],
+            message_id=entry["message_id"],
+            text=_job_header(job) + "\n\n🛑 CAPTCHA/Cloudflare detectado. Abrindo janela manual para preparar a proposta…",
+            parse_mode="HTML",
+            reply_markup=None,
+            disable_web_page_preview=True,
+        )
+        prepared = await crawler.prepare_proposal_for_manual_submit(
+            job.url,
+            text,
+            amount=entry.get("amount"),
+            skills=job.skills,
+            ignore_cooldown=True,
+            allow_challenge=True,
+        )
+        hold_minutes = prepared.get("hold_minutes", 15)
+        screenshot = prepared.get("screenshot")
+        screenshot_line = f"\n\nScreenshot: <code>{_esc(str(screenshot))}</code>" if screenshot else ""
+        if prepared.get("ready"):
+            captcha_note = (
+                " Resolva o CAPTCHA se ele ainda estiver visível e então clique em <b>Enviar orçamento</b>."
+                if prepared.get("captcha_visible")
+                else " Revise e clique em <b>Enviar orçamento</b> manualmente."
+            )
+            await context.bot.edit_message_text(
+                chat_id=entry["chat_id"],
+                message_id=entry["message_id"],
+                text=(
+                    _job_header(job)
+                    + f"\n\n🟣 <b>Proposta preparada após bloqueio de CAPTCHA.</b>\n\n"
+                    f"A janela do Workana está aberta por {hold_minutes} min com a proposta preenchida."
+                    + captcha_note
+                    + screenshot_line
+                ),
+                parse_mode="HTML",
+                reply_markup=None,
+                disable_web_page_preview=True,
+            )
+            _jobs.pop(short_id, None)
+            _save_state()
+            return True
+
+        if prepared.get("reason") == "challenge_required":
+            await context.bot.edit_message_text(
+                chat_id=entry["chat_id"],
+                message_id=entry["message_id"],
+                text=(
+                    _job_header(job)
+                    + f"\n\n🛑 <b>Cloudflare bloqueou antes do formulário carregar.</b>\n\n"
+                    f"A janela do Workana está aberta por {hold_minutes} min. Resolva a verificação manualmente; "
+                    "depois tente enviar a proposta novamente pelo bot."
+                    + screenshot_line
+                ),
+                parse_mode="HTML",
+                reply_markup=_confirm_keyboard(short_id),
+                disable_web_page_preview=True,
+            )
+            return True
+
+        return False
+
     ok = False
     denied = False
     challenge_required = False
@@ -384,7 +449,19 @@ async def _send_to_workana(context: ContextTypes.DEFAULT_TYPE, entry: dict):
     except WorkanaAccessDenied:
         denied = True
     except WorkanaChallengeRequired:
-        challenge_required = True
+        if gpt_action == "proposal" and manual_submit_on_challenge:
+            try:
+                if await _open_manual_window_after_challenge():
+                    return
+            except WorkanaAccessDenied:
+                denied = True
+            except WorkanaChallengeRequired:
+                challenge_required = True
+            except Exception as exc:
+                logger.error("[bot] Falha ao abrir fallback manual após challenge: %s", exc)
+                challenge_required = True
+        else:
+            challenge_required = True
     except Exception as exc:
         logger.error("[bot] Erro ao submeter: %s", exc)
         ok = False

@@ -8,7 +8,8 @@ openai:
 
 workana:
   url: "https://www.workana.com/jobs?category=it-programming&client_history=1&language=en%2Cpt"
-  manual_submit: true
+  manual_submit: false
+  manual_submit_on_challenge: true
   manual_submit_hold_minutes: 15
   challenge_cooldown_minutes: 15
   session_expires: "YYYY-MM-DD"

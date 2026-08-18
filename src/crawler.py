@@ -626,9 +626,12 @@ class WorkanaCrawler:
         text: str,
         amount: int | None = None,
         skills: list[str] | None = None,
+        ignore_cooldown: bool = False,
+        allow_challenge: bool = False,
     ) -> dict:
         """Preenche a proposta em uma janela visível e deixa o submit para o usuário."""
-        self._raise_if_challenge_cooldown()
+        if not ignore_cooldown:
+            self._raise_if_challenge_cooldown()
         await self._ensure_authenticated(headless=False)
         page = await self._context.new_page()
         keep_open = False
@@ -651,10 +654,28 @@ class WorkanaCrawler:
                 await page.goto(self._bid_url(job_url), wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(random.randint(2500, 4000))
 
-            if challenge_seen or await self._captcha_required(page):
-                await self._screenshot(page, "cloudflare_challenge")
-                self._mark_challenge_required()
-                raise WorkanaChallengeRequired(job_url)
+            challenge_required = challenge_seen or await self._captcha_required(page)
+            if challenge_required:
+                form_loaded = await page.locator("textarea[name='bid[content]']").count() > 0
+                if not allow_challenge:
+                    await self._screenshot(page, "cloudflare_challenge")
+                    self._mark_challenge_required()
+                    raise WorkanaChallengeRequired(job_url)
+                if not form_loaded:
+                    screenshot = await self._screenshot(page, "manual_challenge_required")
+                    await page.bring_to_front()
+                    hold_minutes = int(self.config.get("workana", {}).get("manual_submit_hold_minutes", 15))
+                    keep_open = True
+                    asyncio.create_task(self._hold_manual_page(page, hold_minutes))
+                    logger.warning("[crawler] Challenge bloqueou o formulário; janela aberta para verificação manual")
+                    return {
+                        "ready": False,
+                        "reason": "challenge_required",
+                        "url": page.url,
+                        "screenshot": screenshot,
+                        "hold_minutes": hold_minutes,
+                    }
+                logger.warning("[crawler] CAPTCHA detectado no formulário; preparando campos para envio manual")
 
             if await self._check_access_denied(page):
                 raise WorkanaAccessDenied(job_url)
@@ -712,10 +733,13 @@ class WorkanaCrawler:
                 pass
 
             await page.wait_for_timeout(random.randint(1200, 2200))
-            if challenge_seen or await self._captcha_required(page):
+            captcha_visible = challenge_seen or await self._captcha_required(page)
+            if captcha_visible and not allow_challenge:
                 await self._screenshot(page, "captcha_required")
                 self._mark_challenge_required()
                 raise WorkanaChallengeRequired(job_url)
+            if captcha_visible:
+                logger.warning("[crawler] CAPTCHA ainda visível; proposta ficará preparada para envio manual")
 
             submit_btn = page.locator(
                 "button:has-text('Enviar orçamento'), "
@@ -736,6 +760,7 @@ class WorkanaCrawler:
                 "url": page.url,
                 "screenshot": screenshot,
                 "hold_minutes": hold_minutes,
+                "captcha_visible": captcha_visible,
             }
         except WorkanaAccessDenied:
             raise
