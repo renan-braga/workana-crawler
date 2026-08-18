@@ -1,0 +1,22 @@
+telegram:
+  bot_token: "COLOQUE_SEU_TELEGRAM_BOT_TOKEN"
+  chat_id: "COLOQUE_SEU_CHAT_ID"
+
+openai:
+  api_key: "COLOQUE_SUA_OPENAI_API_KEY"
+  model: "gpt-5.5"
+
+workana:
+  url: "https://www.workana.com/jobs?category=it-programming&client_history=1&language=en%2Cpt"
+  session_expires: "YYYY-MM-DD"
+  email: "COLOQUE_SEU_EMAIL"
+  password: "COLOQUE_SUA_SENHA"
+  cookies:
+    workana_session: "COLOQUE_O_COOKIE_WORKANA_SESSION"
+    "appcookie[wd]": "COLOQUE_O_COOKIE_APP_WD"
+    "appcookie[wldh]": "COLOQUE_O_COOKIE_APP_WLDH"
+    "appcookie[activeSession]": "1"
+    dcstcookieii: "COLOQUE_O_COOKIE_DCST"
+
+scheduler:
+  interval_minutes: 30
