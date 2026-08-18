@@ -318,13 +318,15 @@ async def _send_to_workana(context: ContextTypes.DEFAULT_TYPE, entry: dict):
     label = "proposta" if gpt_action == "proposal" else "pergunta"
     text = entry["text"]
     short_id = entry["short_id"]
+    config = context.bot_data.get("config", {})
+    manual_submit = bool(config.get("workana", {}).get("manual_submit", False))
 
     _awaiting_context.pop(str(entry["chat_id"]), None)
 
     await context.bot.edit_message_text(
         chat_id=entry["chat_id"],
         message_id=entry["message_id"],
-        text=_job_header(job) + f"\n\n⏳ Enviando {label} para o Workana…",
+        text=_job_header(job) + f"\n\n⏳ {'Preparando' if manual_submit and gpt_action == 'proposal' else 'Enviando'} {label} no Workana…",
         parse_mode="HTML",
         reply_markup=None,
         disable_web_page_preview=True,
@@ -347,7 +349,35 @@ async def _send_to_workana(context: ContextTypes.DEFAULT_TYPE, entry: dict):
     denied = False
     challenge_required = False
     try:
-        if gpt_action == "proposal":
+        if gpt_action == "proposal" and manual_submit:
+            prepared = await crawler.prepare_proposal_for_manual_submit(
+                job.url,
+                text,
+                amount=entry.get("amount"),
+                skills=job.skills,
+            )
+            if prepared.get("ready"):
+                hold_minutes = prepared.get("hold_minutes", 15)
+                screenshot = prepared.get("screenshot")
+                await context.bot.edit_message_text(
+                    chat_id=entry["chat_id"],
+                    message_id=entry["message_id"],
+                    text=(
+                        _job_header(job)
+                        + f"\n\n🟣 <b>Proposta preparada para envio manual.</b>\n\n"
+                        f"A janela do Workana está aberta por {hold_minutes} min com a proposta preenchida. "
+                        "Revise e clique em <b>Enviar orçamento</b> manualmente."
+                        + (f"\n\nScreenshot: <code>{_esc(str(screenshot))}</code>" if screenshot else "")
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=None,
+                    disable_web_page_preview=True,
+                )
+                _jobs.pop(short_id, None)
+                _save_state()
+                return
+            ok = False
+        elif gpt_action == "proposal":
             ok = await crawler.submit_proposal(job.url, text, amount=entry.get("amount"), skills=job.skills)
         else:
             ok = await crawler.submit_question(job.url, text)

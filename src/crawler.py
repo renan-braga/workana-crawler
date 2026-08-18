@@ -216,8 +216,12 @@ class WorkanaCrawler:
         self._context: BrowserContext | None = None
         self._authenticated: bool = False
         self._challenge_cooldown_until: float = 0.0
+        self._headless: bool | None = None
 
-    async def _ensure_browser(self):
+    async def _ensure_browser(self, headless: bool | None = None):
+        wk = self.config.get("workana", {})
+        desired_headless = bool(wk.get("headless", True)) if headless is None else headless
+
         # Reinicia se o processo do browser foi encerrado inesperadamente
         if self._browser is not None and not self._browser.is_connected():
             logger.warning("[crawler] Browser desconectado — reiniciando…")
@@ -228,13 +232,19 @@ class WorkanaCrawler:
             self._browser = None
             self._context = None
             self._authenticated = False
+            self._headless = None
+
+        # O preparo manual precisa de janela visível; se já havia browser headless, recria.
+        if self._browser is not None and self._headless != desired_headless:
+            await self.close()
 
         if self._browser is None:
             self._pw = await async_playwright().start()
             self._browser = await self._pw.chromium.launch(
-                headless=True,
+                headless=desired_headless,
                 args=["--disable-blink-features=AutomationControlled"],
             )
+            self._headless = desired_headless
             self._context = await self._browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -339,8 +349,8 @@ class WorkanaCrawler:
         finally:
             await page.close()
 
-    async def _ensure_authenticated(self):
-        await self._ensure_browser()
+    async def _ensure_authenticated(self, headless: bool | None = None):
+        await self._ensure_browser(headless=headless)
         if self._authenticated:
             return
         # Tenta validar cookies de sessão antes de fazer login por formulário
@@ -367,6 +377,8 @@ class WorkanaCrawler:
             await self._pw.stop()
             self._browser = None
             self._context = None
+            self._authenticated = False
+            self._headless = None
 
     @staticmethod
     def _bid_url(job_url: str, tab: str = "") -> str:
@@ -381,6 +393,7 @@ class WorkanaCrawler:
         path = Path(__file__).parent.parent / "logs" / f"{ts}_{name}.png"
         await page.screenshot(path=str(path))
         logger.info("[crawler] Screenshot: %s", path)
+        return str(path)
 
     async def _check_access_denied(self, page) -> bool:
         """Retorna True se a página exibe 'Acesso Negado', salvando screenshot."""
@@ -593,6 +606,152 @@ class WorkanaCrawler:
         for _ in range(steps):
             await page.mouse.wheel(0, per_step)
             await page.wait_for_timeout(random.randint(80, 200))
+
+    async def _hold_manual_page(self, page, hold_minutes: int):
+        try:
+            await page.wait_for_timeout(max(1, hold_minutes) * 60 * 1000)
+        except Exception:
+            pass
+        finally:
+            try:
+                if not page.is_closed():
+                    await page.close()
+                    logger.info("[crawler] Página manual fechada após %d min", hold_minutes)
+            except Exception:
+                pass
+
+    async def prepare_proposal_for_manual_submit(
+        self,
+        job_url: str,
+        text: str,
+        amount: int | None = None,
+        skills: list[str] | None = None,
+    ) -> dict:
+        """Preenche a proposta em uma janela visível e deixa o submit para o usuário."""
+        self._raise_if_challenge_cooldown()
+        await self._ensure_authenticated(headless=False)
+        page = await self._context.new_page()
+        keep_open = False
+        challenge_seen = False
+
+        async def _log_resp(resp):
+            nonlocal challenge_seen
+            if "challenges.cloudflare.com" in resp.url or "/cdn-cgi/challenge-platform/" in resp.url:
+                challenge_seen = True
+            if resp.status >= 400 and not self._is_noisy_status_url(resp.url):
+                logger.warning("[crawler] HTTP %s ← %s", resp.status, self._short_log_url(resp.url))
+        page.on("response", _log_resp)
+
+        try:
+            await page.goto(self._bid_url(job_url), wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(random.randint(2500, 4500))
+            if await self._check_and_reauth(page):
+                page = await self._context.new_page()
+                page.on("response", _log_resp)
+                await page.goto(self._bid_url(job_url), wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(random.randint(2500, 4000))
+
+            if challenge_seen or await self._captcha_required(page):
+                await self._screenshot(page, "cloudflare_challenge")
+                self._mark_challenge_required()
+                raise WorkanaChallengeRequired(job_url)
+
+            if await self._check_access_denied(page):
+                raise WorkanaAccessDenied(job_url)
+
+            await self._human_scroll(page, 300)
+            await page.wait_for_timeout(random.randint(500, 1000))
+
+            textarea = page.locator("textarea[name='bid[content]']")
+            await self._human_type(page, textarea, text)
+            await page.wait_for_timeout(random.randint(600, 1200))
+
+            delivery = page.locator("input[name='bid[deliveryTime]']")
+            if await delivery.count() > 0:
+                min_days = await delivery.get_attribute("min")
+                await delivery.click(click_count=3)
+                await page.wait_for_timeout(random.randint(200, 400))
+                await delivery.type(min_days if min_days and min_days.isdigit() else "7", delay=random.randint(50, 100))
+                await page.wait_for_timeout(random.randint(300, 600))
+
+            amount_field = page.locator("input[name='bid[amount]']")
+            if await amount_field.count() > 0:
+                min_val = int(await amount_field.get_attribute("min") or 0)
+                bid_val = max(amount, min_val) if amount else max(min_val, 100)
+                await amount_field.click(click_count=3)
+                await page.wait_for_timeout(random.randint(200, 400))
+                await amount_field.type(str(bid_val), delay=random.randint(60, 120))
+                logger.info("[crawler] Orçamento preparado: R$ %s", bid_val)
+                await page.wait_for_timeout(random.randint(400, 800))
+
+            try:
+                if await page.locator("div.modal.fade.in").count() > 0:
+                    await page.keyboard.press("Escape")
+                    await page.wait_for_timeout(random.randint(700, 1200))
+                    logger.info("[crawler] Modal fechado antes de preencher skills")
+            except Exception:
+                pass
+
+            skills_input = page.locator("input[placeholder*='habilidade'], input[placeholder*='Pesquisar habilidade']").first
+            if await skills_input.count() > 0:
+                await skills_input.scroll_into_view_if_needed()
+                await page.wait_for_timeout(random.randint(800, 1500))
+                selected_skills = await self._fill_skills(page, skills_input, skills)
+                if selected_skills == 0:
+                    await self._screenshot(page, "skills_required_missing")
+                    logger.warning("[crawler] Nenhuma skill selecionada; preparo manual cancelado")
+                    return {"ready": False, "reason": "skills_required_missing"}
+
+            try:
+                cookie_btn = page.locator("button:has-text('Aceitar todos os cookies')")
+                if await cookie_btn.count() > 0 and await cookie_btn.is_visible():
+                    await cookie_btn.click()
+                    await page.wait_for_timeout(800)
+                    logger.info("[crawler] Banner de cookies fechado no preparo manual")
+            except Exception:
+                pass
+
+            await page.wait_for_timeout(random.randint(1200, 2200))
+            if challenge_seen or await self._captcha_required(page):
+                await self._screenshot(page, "captcha_required")
+                self._mark_challenge_required()
+                raise WorkanaChallengeRequired(job_url)
+
+            submit_btn = page.locator(
+                "button:has-text('Enviar orçamento'), "
+                "input[value='Enviar orçamento'], "
+                "button[type='submit'], input[type='submit']"
+            ).last
+            await submit_btn.scroll_into_view_if_needed()
+            await page.wait_for_timeout(random.randint(500, 800))
+            screenshot = await self._screenshot(page, "manual_proposal_ready")
+            await page.bring_to_front()
+
+            hold_minutes = int(self.config.get("workana", {}).get("manual_submit_hold_minutes", 15))
+            keep_open = True
+            asyncio.create_task(self._hold_manual_page(page, hold_minutes))
+            logger.info("[crawler] Proposta preparada para envio manual — %s", page.url)
+            return {
+                "ready": True,
+                "url": page.url,
+                "screenshot": screenshot,
+                "hold_minutes": hold_minutes,
+            }
+        except WorkanaAccessDenied:
+            raise
+        except WorkanaChallengeRequired:
+            raise
+        except Exception as exc:
+            await self._screenshot(page, "manual_proposal_error")
+            logger.error("[crawler] Falha ao preparar proposta manual para %s: %s", job_url, exc)
+            return {"ready": False, "reason": str(exc)}
+        finally:
+            if not keep_open:
+                try:
+                    if not page.is_closed():
+                        await page.close()
+                except Exception:
+                    pass
 
     async def submit_proposal(self, job_url: str, text: str, amount: int | None = None, skills: list[str] | None = None) -> bool:
         """Submete uma proposta navegando direto para /messages/bid/{slug}."""
