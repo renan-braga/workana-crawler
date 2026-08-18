@@ -428,6 +428,7 @@ class WorkanaCrawler:
                       node = node.parentElement;
                     }
                     return input.closest('section, article, .box, .panel, .card, .module, .well')
+                      || input.closest('form')
                       || input.parentElement
                       || document.body;
                   })();
@@ -680,6 +681,8 @@ class WorkanaCrawler:
                 errors = [e.strip() for e in errors if e.strip()]
                 logger.warning("[crawler] Submit não redirecionou — URL: %s | erros: %s", page.url, errors or "nenhum capturado")
             return ok
+        except WorkanaAccessDenied:
+            raise
         except Exception as exc:
             await self._screenshot(page, "proposal_error")
             logger.error("[crawler] Falha ao enviar proposta para %s: %s", job_url, exc)
@@ -724,6 +727,8 @@ class WorkanaCrawler:
                 await self._screenshot(page, "question_submit_failed")
                 logger.warning("[crawler] Pergunta enviada mas URL inesperada: %s", page.url)
             return ok
+        except WorkanaAccessDenied:
+            raise
         except Exception as exc:
             await self._screenshot(page, "question_error")
             logger.error("[crawler] Falha ao enviar pergunta para %s: %s", job_url, exc)
