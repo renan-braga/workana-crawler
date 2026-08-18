@@ -182,6 +182,23 @@ def _confirm_keyboard(short_id: str) -> InlineKeyboardMarkup:
     ])
 
 
+def _manual_draft_keyboard(short_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Já enviei", callback_data=f"done:{short_id}"),
+            InlineKeyboardButton("🔄 Regerar", callback_data=f"retry:{short_id}"),
+        ],
+        [
+            InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel:{short_id}"),
+        ],
+    ])
+
+
+def _bid_url(job_url: str) -> str:
+    slug = job_url.rstrip("/").split("/job/")[-1]
+    return f"https://www.workana.com/messages/bid/{slug}"
+
+
 def _card_state(entry: dict) -> tuple[str, InlineKeyboardMarkup]:
     """Monta o texto e o teclado atuais do card, a partir do estado do job."""
     job = entry["job"]
@@ -347,68 +364,24 @@ async def _send_to_workana(context: ContextTypes.DEFAULT_TYPE, entry: dict):
 
     from .crawler import WorkanaAccessDenied, WorkanaChallengeRequired
 
-    async def _open_manual_window_after_challenge() -> bool:
+    async def _send_manual_draft_after_challenge():
+        amount_line = f"\n\n💰 <b>Orçamento sugerido:</b> R$ {entry['amount']:,}" if entry.get("amount") else ""
         await context.bot.edit_message_text(
             chat_id=entry["chat_id"],
             message_id=entry["message_id"],
-            text=_job_header(job) + "\n\n🛑 CAPTCHA/Cloudflare detectado. Abrindo janela manual para preparar a proposta…",
+            text=(
+                _job_header(job)
+                + "\n\n🛑 <b>Workana pediu Cloudflare/CAPTCHA.</b>\n\n"
+                "Para proteger a conta, parei a automação neste envio. Abra o orçamento no seu navegador normal, "
+                "resolva a verificação se aparecer e cole o rascunho abaixo."
+                + f'\n\n🔗 <a href="{_bid_url(job.url)}">Abrir orçamento no Workana</a>'
+                + amount_line
+                + f"\n\n📋 <b>Rascunho:</b>\n\n<pre>{_esc(text)}</pre>"
+            ),
             parse_mode="HTML",
-            reply_markup=None,
+            reply_markup=_manual_draft_keyboard(short_id),
             disable_web_page_preview=True,
         )
-        prepared = await crawler.prepare_proposal_for_manual_submit(
-            job.url,
-            text,
-            amount=entry.get("amount"),
-            skills=job.skills,
-            ignore_cooldown=True,
-            allow_challenge=True,
-        )
-        hold_minutes = prepared.get("hold_minutes", 15)
-        screenshot = prepared.get("screenshot")
-        screenshot_line = f"\n\nScreenshot: <code>{_esc(str(screenshot))}</code>" if screenshot else ""
-        if prepared.get("ready"):
-            captcha_note = (
-                " Resolva o CAPTCHA se ele ainda estiver visível e então clique em <b>Enviar orçamento</b>."
-                if prepared.get("captcha_visible")
-                else " Revise e clique em <b>Enviar orçamento</b> manualmente."
-            )
-            await context.bot.edit_message_text(
-                chat_id=entry["chat_id"],
-                message_id=entry["message_id"],
-                text=(
-                    _job_header(job)
-                    + f"\n\n🟣 <b>Proposta preparada após bloqueio de CAPTCHA.</b>\n\n"
-                    f"A janela do Workana está aberta por {hold_minutes} min com a proposta preenchida."
-                    + captcha_note
-                    + screenshot_line
-                ),
-                parse_mode="HTML",
-                reply_markup=None,
-                disable_web_page_preview=True,
-            )
-            _jobs.pop(short_id, None)
-            _save_state()
-            return True
-
-        if prepared.get("reason") == "challenge_required":
-            await context.bot.edit_message_text(
-                chat_id=entry["chat_id"],
-                message_id=entry["message_id"],
-                text=(
-                    _job_header(job)
-                    + f"\n\n🛑 <b>Cloudflare bloqueou antes do formulário carregar.</b>\n\n"
-                    f"A janela do Workana está aberta por {hold_minutes} min. Resolva a verificação manualmente; "
-                    "depois tente enviar a proposta novamente pelo bot."
-                    + screenshot_line
-                ),
-                parse_mode="HTML",
-                reply_markup=_confirm_keyboard(short_id),
-                disable_web_page_preview=True,
-            )
-            return True
-
-        return False
 
     ok = False
     denied = False
@@ -450,16 +423,8 @@ async def _send_to_workana(context: ContextTypes.DEFAULT_TYPE, entry: dict):
         denied = True
     except WorkanaChallengeRequired:
         if gpt_action == "proposal" and manual_submit_on_challenge:
-            try:
-                if await _open_manual_window_after_challenge():
-                    return
-            except WorkanaAccessDenied:
-                denied = True
-            except WorkanaChallengeRequired:
-                challenge_required = True
-            except Exception as exc:
-                logger.error("[bot] Falha ao abrir fallback manual após challenge: %s", exc)
-                challenge_required = True
+            await _send_manual_draft_after_challenge()
+            return
         else:
             challenge_required = True
     except Exception as exc:
@@ -608,6 +573,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _awaiting_context.pop(str(query.message.chat_id), None)
         _save_state()
         await _push_card(context.bot, entry)
+        return
+
+    if action == "done":
+        short_id = parts[1]
+        entry = _jobs.pop(short_id, None)
+        _awaiting_context.pop(str(query.message.chat_id), None)
+        _save_state()
+        if entry:
+            job = entry["job"]
+            if entry.get("text"):
+                _save_submission(job, "proposal" if entry.get("action") == "p" else "question", entry["text"])
+            await query.edit_message_text(
+                _job_header(job) + "\n\n✅ <b>Marcado como enviado manualmente</b>",
+                parse_mode="HTML",
+                reply_markup=None,
+                disable_web_page_preview=True,
+            )
         return
 
     if action == "send":
