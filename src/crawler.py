@@ -6,6 +6,7 @@ import asyncio
 import logging
 import random
 import re
+import time
 from dataclasses import dataclass, field
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, Browser, BrowserContext
@@ -17,6 +18,10 @@ BASE = "https://www.workana.com"
 
 class WorkanaAccessDenied(Exception):
     """Job fechado, encerrado ou sem permissão — erro permanente, não retentável."""
+
+
+class WorkanaChallengeRequired(Exception):
+    """Cloudflare/CAPTCHA pediu intervenção manual — erro temporário, com cooldown."""
 
 
 @dataclass
@@ -210,6 +215,7 @@ class WorkanaCrawler:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._authenticated: bool = False
+        self._challenge_cooldown_until: float = 0.0
 
     async def _ensure_browser(self):
         # Reinicia se o processo do browser foi encerrado inesperadamente
@@ -387,6 +393,40 @@ class WorkanaCrawler:
             pass
         return False
 
+    @staticmethod
+    def _short_log_url(url: str) -> str:
+        """Evita despejar tokens enormes de challenge no log."""
+        if "challenges.cloudflare.com" in url or "/cdn-cgi/challenge-platform/" in url:
+            return re.sub(r"/[^/?#]{80,}.*$", "/<challenge-token>", url)
+        return url if len(url) <= 240 else f"{url[:237]}..."
+
+    @staticmethod
+    def _is_noisy_status_url(url: str) -> bool:
+        return any(
+            fragment in url
+            for fragment in (
+                "/notifications/channel_access",
+                "/favorite_files/get_favorite_files",
+                "/portfolios/",
+            )
+        )
+
+    def _challenge_cooldown_seconds(self) -> int:
+        wk = self.config.get("workana", {})
+        minutes = int(wk.get("challenge_cooldown_minutes", 15))
+        return max(minutes, 1) * 60
+
+    def _mark_challenge_required(self):
+        cooldown = self._challenge_cooldown_seconds()
+        self._challenge_cooldown_until = time.monotonic() + cooldown
+        logger.warning("[crawler] Proteção Cloudflare/CAPTCHA detectada; pausando envios por %d min", cooldown // 60)
+
+    def _raise_if_challenge_cooldown(self):
+        remaining = int(self._challenge_cooldown_until - time.monotonic())
+        if remaining > 0:
+            logger.warning("[crawler] Envio bloqueado por cooldown anti-challenge (%d min restantes)", max(1, remaining // 60))
+            raise WorkanaChallengeRequired("cooldown ativo após Cloudflare/CAPTCHA")
+
     async def _captcha_required(self, page) -> bool:
         """Retorna True quando o formulário exibe CAPTCHA/Turnstile."""
         try:
@@ -556,16 +596,21 @@ class WorkanaCrawler:
 
     async def submit_proposal(self, job_url: str, text: str, amount: int | None = None, skills: list[str] | None = None) -> bool:
         """Submete uma proposta navegando direto para /messages/bid/{slug}."""
+        self._raise_if_challenge_cooldown()
         # Reaproveita cookies de sessão válidos quando possível — só faz login por
         # formulário se a sessão realmente estiver inválida. O CSRF fica fresco de
         # qualquer forma, pois a página do bid é sempre recarregada logo abaixo.
         await self._ensure_authenticated()
         page = await self._context.new_page()
+        challenge_seen = False
 
         # Intercepta respostas HTTP >= 400 para diagnóstico
         async def _log_resp(resp):
-            if resp.status >= 400:
-                logger.warning("[crawler] HTTP %s ← %s", resp.status, resp.url)
+            nonlocal challenge_seen
+            if "challenges.cloudflare.com" in resp.url or "/cdn-cgi/challenge-platform/" in resp.url:
+                challenge_seen = True
+            if resp.status >= 400 and not self._is_noisy_status_url(resp.url):
+                logger.warning("[crawler] HTTP %s ← %s", resp.status, self._short_log_url(resp.url))
         page.on("response", _log_resp)
 
         try:
@@ -574,8 +619,14 @@ class WorkanaCrawler:
             await page.wait_for_timeout(random.randint(2500, 4500))
             if await self._check_and_reauth(page):
                 page = await self._context.new_page()
+                page.on("response", _log_resp)
                 await page.goto(self._bid_url(job_url), wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(random.randint(2500, 4000))
+
+            if challenge_seen or await self._captcha_required(page):
+                await self._screenshot(page, "cloudflare_challenge")
+                self._mark_challenge_required()
+                raise WorkanaChallengeRequired(job_url)
 
             if await self._check_access_denied(page):
                 raise WorkanaAccessDenied(job_url)
@@ -649,10 +700,10 @@ class WorkanaCrawler:
 
             # Pausa final antes de submeter — simula revisão
             await page.wait_for_timeout(random.randint(1500, 3000))
-            if await self._captcha_required(page):
+            if challenge_seen or await self._captcha_required(page):
                 await self._screenshot(page, "captcha_required")
-                logger.warning("[crawler] CAPTCHA detectado no formulário; envio cancelado para intervenção manual")
-                return False
+                self._mark_challenge_required()
+                raise WorkanaChallengeRequired(job_url)
 
             submit_btn = page.locator(
                 "button:has-text('Enviar orçamento'), "
@@ -683,6 +734,8 @@ class WorkanaCrawler:
             return ok
         except WorkanaAccessDenied:
             raise
+        except WorkanaChallengeRequired:
+            raise
         except Exception as exc:
             await self._screenshot(page, "proposal_error")
             logger.error("[crawler] Falha ao enviar proposta para %s: %s", job_url, exc)
@@ -692,15 +745,32 @@ class WorkanaCrawler:
 
     async def submit_question(self, job_url: str, text: str) -> bool:
         """Envia uma pergunta navegando para /messages/bid/{slug}/?tab=message."""
+        self._raise_if_challenge_cooldown()
         await self._ensure_authenticated()
         page = await self._context.new_page()
+        challenge_seen = False
+
+        async def _log_resp(resp):
+            nonlocal challenge_seen
+            if "challenges.cloudflare.com" in resp.url or "/cdn-cgi/challenge-platform/" in resp.url:
+                challenge_seen = True
+            if resp.status >= 400 and not self._is_noisy_status_url(resp.url):
+                logger.warning("[crawler] HTTP %s ← %s", resp.status, self._short_log_url(resp.url))
+        page.on("response", _log_resp)
+
         try:
             await page.goto(self._bid_url(job_url, tab="message"), wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(random.randint(2500, 4500))
             if await self._check_and_reauth(page):
                 page = await self._context.new_page()
+                page.on("response", _log_resp)
                 await page.goto(self._bid_url(job_url, tab="message"), wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(random.randint(2500, 4000))
+
+            if challenge_seen or await self._captcha_required(page):
+                await self._screenshot(page, "cloudflare_challenge")
+                self._mark_challenge_required()
+                raise WorkanaChallengeRequired(job_url)
 
             if await self._check_access_denied(page):
                 raise WorkanaAccessDenied(job_url)
@@ -728,6 +798,8 @@ class WorkanaCrawler:
                 logger.warning("[crawler] Pergunta enviada mas URL inesperada: %s", page.url)
             return ok
         except WorkanaAccessDenied:
+            raise
+        except WorkanaChallengeRequired:
             raise
         except Exception as exc:
             await self._screenshot(page, "question_error")

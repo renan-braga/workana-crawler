@@ -342,9 +342,10 @@ async def _send_to_workana(context: ContextTypes.DEFAULT_TYPE, entry: dict):
         )
         return
 
-    from .crawler import WorkanaAccessDenied
+    from .crawler import WorkanaAccessDenied, WorkanaChallengeRequired
     ok = False
     denied = False
+    challenge_required = False
     try:
         if gpt_action == "proposal":
             ok = await crawler.submit_proposal(job.url, text, amount=entry.get("amount"), skills=job.skills)
@@ -352,6 +353,8 @@ async def _send_to_workana(context: ContextTypes.DEFAULT_TYPE, entry: dict):
             ok = await crawler.submit_question(job.url, text)
     except WorkanaAccessDenied:
         denied = True
+    except WorkanaChallengeRequired:
+        challenge_required = True
     except Exception as exc:
         logger.error("[bot] Erro ao submeter: %s", exc)
         ok = False
@@ -367,6 +370,21 @@ async def _send_to_workana(context: ContextTypes.DEFAULT_TYPE, entry: dict):
         )
         _jobs.pop(short_id, None)
         _save_state()
+        return
+
+    if challenge_required:
+        await context.bot.edit_message_text(
+            chat_id=entry["chat_id"],
+            message_id=entry["message_id"],
+            text=(
+                _job_header(job)
+                + f"\n\n🛑 Workana pediu verificação Cloudflare/CAPTCHA — {label} não enviada. "
+                "Abra o Workana manualmente nessa sessão, resolva a verificação se aparecer e aguarde alguns minutos antes de tentar de novo."
+            ),
+            parse_mode="HTML",
+            reply_markup=None,
+            disable_web_page_preview=True,
+        )
         return
 
     if ok:
