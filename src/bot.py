@@ -169,17 +169,29 @@ def _price_tier_keyboard(short_id: str, job: WorkanaJob) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(rows)
 
 
-def _confirm_keyboard(short_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Enviar", callback_data=f"send:{short_id}"),
-            InlineKeyboardButton("🔄 Regerar", callback_data=f"retry:{short_id}"),
-        ],
+def _bid_url(job_url: str) -> str:
+    slug = job_url.rstrip("/").split("/job/")[-1]
+    return f"https://www.workana.com/messages/bid/{slug}"
+
+
+def _confirm_keyboard(short_id: str, job_url: str | None = None, is_proposal: bool = True) -> InlineKeyboardMarkup:
+    first_row = [
+        InlineKeyboardButton("✅ Enviar", callback_data=f"send:{short_id}"),
+        InlineKeyboardButton("🔄 Regerar", callback_data=f"retry:{short_id}"),
+    ]
+    if is_proposal:
+        first_row.insert(1, InlineKeyboardButton("📋 Rascunho", callback_data=f"draft:{short_id}"))
+
+    rows = [
+        first_row,
         [
             InlineKeyboardButton("✏️ Valor/Contexto", callback_data=f"ctx:{short_id}"),
             InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel:{short_id}"),
         ],
-    ])
+    ]
+    if job_url and is_proposal:
+        rows.insert(1, [InlineKeyboardButton("🔗 Abrir orçamento", url=_bid_url(job_url))])
+    return InlineKeyboardMarkup(rows)
 
 
 def _manual_draft_keyboard(short_id: str) -> InlineKeyboardMarkup:
@@ -192,11 +204,6 @@ def _manual_draft_keyboard(short_id: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel:{short_id}"),
         ],
     ])
-
-
-def _bid_url(job_url: str) -> str:
-    slug = job_url.rstrip("/").split("/job/")[-1]
-    return f"https://www.workana.com/messages/bid/{slug}"
 
 
 def _card_state(entry: dict) -> tuple[str, InlineKeyboardMarkup]:
@@ -220,7 +227,7 @@ def _card_state(entry: dict) -> tuple[str, InlineKeyboardMarkup]:
             "\n\n<i>💬 Quer ajustar (valor, foco, tom)? Clique ✏️ Valor/Contexto, digite "
             "e depois clique 🔄 Regerar pra aplicar.</i>"
         )
-        return text, _confirm_keyboard(entry["short_id"])
+        return text, _confirm_keyboard(entry["short_id"], job.url, entry["action"] == "p")
 
     if entry.get("style"):
         text += "\n\n💰 Escolha a faixa de valor:"
@@ -250,6 +257,26 @@ async def _push_card(bot, entry: dict):
         )
     except Exception as exc:
         logger.warning("[bot] Falha ao atualizar card: %s", exc)
+
+
+async def _send_manual_draft(context: ContextTypes.DEFAULT_TYPE, entry: dict, intro: str):
+    job = entry["job"]
+    text = entry["text"] or ""
+    amount_line = f"\n\n💰 <b>Orçamento sugerido:</b> R$ {entry['amount']:,}" if entry.get("amount") else ""
+    await context.bot.edit_message_text(
+        chat_id=entry["chat_id"],
+        message_id=entry["message_id"],
+        text=(
+            _job_header(job)
+            + intro
+            + f'\n\n🔗 <a href="{_bid_url(job.url)}">Abrir orçamento no Workana</a>'
+            + amount_line
+            + f"\n\n📋 <b>Rascunho:</b>\n\n<pre>{_esc(text)}</pre>"
+        ),
+        parse_mode="HTML",
+        reply_markup=_manual_draft_keyboard(entry["short_id"]),
+        disable_web_page_preview=True,
+    )
 
 
 async def notify_warning(text: str, app: Application, chat_id: str):
@@ -357,7 +384,7 @@ async def _send_to_workana(context: ContextTypes.DEFAULT_TYPE, entry: dict):
             message_id=entry["message_id"],
             text=_job_header(job) + "\n\n⚠️ Crawler não disponível. Reinicie o bot.",
             parse_mode="HTML",
-            reply_markup=_confirm_keyboard(short_id),
+            reply_markup=_confirm_keyboard(short_id, job.url, gpt_action == "proposal"),
             disable_web_page_preview=True,
         )
         return
@@ -365,22 +392,12 @@ async def _send_to_workana(context: ContextTypes.DEFAULT_TYPE, entry: dict):
     from .crawler import WorkanaAccessDenied, WorkanaChallengeRequired
 
     async def _send_manual_draft_after_challenge():
-        amount_line = f"\n\n💰 <b>Orçamento sugerido:</b> R$ {entry['amount']:,}" if entry.get("amount") else ""
-        await context.bot.edit_message_text(
-            chat_id=entry["chat_id"],
-            message_id=entry["message_id"],
-            text=(
-                _job_header(job)
-                + "\n\n🛑 <b>Workana pediu Cloudflare/CAPTCHA.</b>\n\n"
-                "Para proteger a conta, parei a automação neste envio. Abra o orçamento no seu navegador normal, "
-                "resolva a verificação se aparecer e cole o rascunho abaixo."
-                + f'\n\n🔗 <a href="{_bid_url(job.url)}">Abrir orçamento no Workana</a>'
-                + amount_line
-                + f"\n\n📋 <b>Rascunho:</b>\n\n<pre>{_esc(text)}</pre>"
-            ),
-            parse_mode="HTML",
-            reply_markup=_manual_draft_keyboard(short_id),
-            disable_web_page_preview=True,
+        await _send_manual_draft(
+            context,
+            entry,
+            "\n\n🛑 <b>Workana pediu Cloudflare/CAPTCHA.</b>\n\n"
+            "Para proteger a conta, parei a automação neste envio. Abra o orçamento no seu navegador normal, "
+            "resolva a verificação se aparecer e cole o rascunho abaixo.",
         )
 
     ok = False
@@ -478,7 +495,7 @@ async def _send_to_workana(context: ContextTypes.DEFAULT_TYPE, entry: dict):
             message_id=entry["message_id"],
             text=_job_header(job) + f"\n\n❌ Falha ao enviar {label}. Tente novamente.",
             parse_mode="HTML",
-            reply_markup=_confirm_keyboard(short_id),
+            reply_markup=_confirm_keyboard(short_id, job.url, gpt_action == "proposal"),
             disable_web_page_preview=True,
         )
 
@@ -590,6 +607,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=None,
                 disable_web_page_preview=True,
             )
+        return
+
+    if action == "draft":
+        short_id = parts[1]
+        entry = _jobs.get(short_id)
+        if not entry or not entry.get("text"):
+            return
+        await _send_manual_draft(
+            context,
+            entry,
+            "\n\n⚡ <b>Envio manual rápido.</b>\n\n"
+            "Abra o orçamento no Workana, cole o rascunho abaixo, confira skills/prazo/valor e envie no seu navegador normal.",
+        )
         return
 
     if action == "send":
