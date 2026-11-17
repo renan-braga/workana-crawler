@@ -1,8 +1,27 @@
+# Segredos e configuração local (use config.example.yaml como modelo)
 config.yaml
+.env
+.env.*
+
+# Dados locais, sessão e screenshots do Playwright
 *.db
-.DS_Store
+*.db-journal
+*.sqlite*
+logs/
+
+# Instruções de agentes de IA (uso local)
+CLAUDE.md
+AGENTS.md
+.claude/
+
+# Python
 .venv/
+venv/
 __pycache__/
 *.pyc
-.env
-logs/
+.pytest_cache/
+
+# Editor / SO
+.idea/
+.vscode/
+.DS_Store
